@@ -17,16 +17,17 @@
 
 ## 安装
 
-使用 Agent Skills CLI：
+使用 Agent Skills CLI 安装仓库中的 `html-annotation-editor` Skill：
 
 ```bash
-npx skills add IMinnn/html-annotation-editor-Skill -g -a codex -y
+npx skills add https://github.com/IMinnn/html-annotation-editor-Skill/tree/main/html-annotation-editor -g -a codex -y
 ```
 
 或手动安装到 Codex：
 
 ```bash
-git clone https://github.com/IMinnn/html-annotation-editor-Skill.git ~/.codex/skills/html-annotation-editor
+git clone https://github.com/IMinnn/html-annotation-editor-Skill.git
+cp -R html-annotation-editor-Skill/html-annotation-editor ~/.codex/skills/html-annotation-editor
 ```
 
 安装后重启 Codex，使其重新发现 Skill。
@@ -73,22 +74,23 @@ prototype-已标注.html
 
 ```text
 .
-|-- SKILL.md
 |-- README.md
-|-- assets/
-|   `-- editor.js
-|-- references/
-|   `-- data-and-integration.md
-`-- scripts/
-    |-- inject.py
-    `-- self-check.cjs
+`-- html-annotation-editor/
+    |-- SKILL.md
+    |-- assets/
+    |   `-- editor.js
+    |-- references/
+    |   `-- data-and-integration.md
+    `-- scripts/
+        |-- inject.py
+        `-- self-check.cjs
 ```
 
-- `SKILL.md`：Skill 入口、决策规则和完整工作流
-- `assets/editor.js`：注入 HTML 的离线编辑器运行时
-- `references/data-and-integration.md`：数据结构、动态页面和迁移说明
-- `scripts/inject.py`：使用 Python 标准库生成已标注 HTML
-- `scripts/self-check.cjs`：运行时、注入和导出回归检查
+- `html-annotation-editor/SKILL.md`：Skill 入口、决策规则和完整工作流
+- `html-annotation-editor/assets/editor.js`：注入 HTML 的离线编辑器运行时
+- `html-annotation-editor/references/data-and-integration.md`：数据结构、动态页面和迁移说明
+- `html-annotation-editor/scripts/inject.py`：使用 Python 标准库生成已标注 HTML
+- `html-annotation-editor/scripts/self-check.cjs`：运行时、注入和导出回归检查
 
 ## 要求与验证
 
@@ -98,7 +100,7 @@ prototype-已标注.html
 - 查看和编辑注记：现代桌面浏览器
 
 ```bash
-node scripts/self-check.cjs
+node html-annotation-editor/scripts/self-check.cjs
 ```
 
 自检覆盖注记增删改、编号、菜单、导航适配、清单导出、源码保留和重复注入。浏览器布局、指针选区和原型业务交互仍应在真实目标页面中验证。
@@ -119,4 +121,4 @@ node scripts/self-check.cjs
 - 定位失效时提示未匹配，不静默绑定到相似元素
 - 不覆盖现有成果，不安装运行时依赖，不上传业务原型
 
-详细约束和数据格式见 [SKILL.md](./SKILL.md) 与 [数据和接入说明](./references/data-and-integration.md)。
+详细约束和数据格式见 [SKILL.md](./html-annotation-editor/SKILL.md) 与 [数据和接入说明](./html-annotation-editor/references/data-and-integration.md)。
