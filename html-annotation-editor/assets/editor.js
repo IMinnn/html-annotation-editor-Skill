@@ -16,12 +16,24 @@
       typeof note.body === 'string' && note.body.trim() && typeof note.selector === 'string' && note.selector.trim() &&
       (note.type === undefined || types.includes(note.type)));
   }
-  function loadStoredNotes(storage, key, fallback) {
-    try {const saved=JSON.parse(storage.getItem(key)); return validStoredNotes(saved) ? clone(saved) : clone(fallback);}
-    catch {return clone(fallback);}
+  function loadStoredState(storage, key, fallback, fallbackSavedAt = 0) {
+    const embedded = {notes:clone(fallback),savedAt:fallbackSavedAt};
+    try {
+      const saved = JSON.parse(storage.getItem(key));
+      if (validStoredNotes(saved) && !fallbackSavedAt) return {notes:clone(saved),savedAt:0};
+      if (saved && validStoredNotes(saved.notes) && Number.isFinite(saved.savedAt) && saved.savedAt > fallbackSavedAt) return clone(saved);
+    } catch {}
+    return embedded;
   }
-  function persistNotes(storage, key, notes) {
-    try {storage.setItem(key,JSON.stringify(notes)); return true;} catch {return false;}
+  function persistNotes(storage, key, notes, savedAt) {
+    try {storage.setItem(key,JSON.stringify({notes,savedAt})); return true;} catch {return false;}
+  }
+  function buildAnnotatedHTML(base, data, runtime) {
+    const bytes=Uint8Array.from(atob(base),character=>character.charCodeAt(0));
+    const source=new TextDecoder().decode(bytes), serialized=safeJSON(data), closeScript='</scr'+'ipt>';
+    const block='<!-- HTML-ANNOTATION-EDITOR:BEGIN -->\n<script id="hae-data" type="application/json">'+serialized+closeScript+'\n<script id="hae-runtime">'+runtime+closeScript+'\n<!-- HTML-ANNOTATION-EDITOR:END -->\n';
+    const closings=[...source.matchAll(/<\/body\s*>/ig)], at=closings.length ? closings.at(-1).index : source.length;
+    return source.slice(0,at)+block+source.slice(at);
   }
   const listHeaders = ['编号','菜单路径','目标区域','注记类型','注记内容'];
   function annotationTable(notes, menus, doc, exportType = 'simple') {
@@ -183,20 +195,61 @@
     return {x, y:Math.max(12, Math.min(y, viewport.height-height-12))};
   }
   if (typeof document === 'undefined') {
-    if (typeof module !== 'undefined' && module.exports) module.exports = {insertNote, editNote, removeNote, safeJSON, noteStorageKey, validStoredNotes, loadStoredNotes, persistNotes, placePopover, discoverMenus, menuForNote, directoryGroups, annotationTable, listMarkdown, listXLSX};
+    if (typeof module !== 'undefined' && module.exports) module.exports = {insertNote, editNote, removeNote, safeJSON, noteStorageKey, validStoredNotes, loadStoredState, persistNotes, buildAnnotatedHTML, placePopover, discoverMenus, menuForNote, directoryGroups, annotationTable, listMarkdown, listXLSX};
     return;
   }
   if (document.getElementById('hae-root')) return;
 
   const config = JSON.parse(document.getElementById('hae-data').textContent);
   const storageKey = noteStorageKey(config.base || '');
+  const handleKey = storageKey+':'+location.pathname;
   let noteStorage = null; try {noteStorage = window.localStorage;} catch {}
-  let notes = loadStoredNotes(noteStorage,storageKey,config.notes), hasPageChanges = false;
-  config.notes = clone(notes);
+  const stored = loadStoredState(noteStorage,storageKey,config.notes,config.savedAt || 0);
+  let notes = stored.notes, hasPageChanges = JSON.stringify(stored.notes) !== JSON.stringify(config.notes), fileHandle = null;
+  config.notes = clone(notes); config.savedAt = stored.savedAt;
   document.getElementById('hae-data').textContent = safeJSON(config);
   let selected = null, formNote = null, picking = false, candidate = null, chain = [], depth = 0;
   let shown = true, mode = 'number', dock = 'right', panelView = null, queued = false;
-  let restoreFocus = null;
+  let restoreFocus = null, acquiringHandle = null, fileWriteQueue = Promise.resolve();
+  function openHandleDB() {
+    return new Promise((resolve,reject) => {
+      const request=indexedDB.open('html-annotation-editor',1);
+      request.onupgradeneeded=()=>request.result.createObjectStore('files');
+      request.onsuccess=()=>resolve(request.result); request.onerror=()=>reject(request.error);
+    });
+  }
+  async function readFileHandle() {
+    const db=await openHandleDB();
+    try {return await new Promise((resolve,reject)=>{const request=db.transaction('files').objectStore('files').get(handleKey);request.onsuccess=()=>resolve(request.result || null);request.onerror=()=>reject(request.error);});}
+    finally {db.close();}
+  }
+  async function rememberFileHandle(handle) {
+    const db=await openHandleDB();
+    try {await new Promise((resolve,reject)=>{const transaction=db.transaction('files','readwrite');transaction.objectStore('files').put(handle,handleKey);transaction.oncomplete=()=>resolve();transaction.onabort=()=>reject(transaction.error);transaction.onerror=()=>reject(transaction.error);});}
+    finally {db.close();}
+  }
+  readFileHandle().then(handle=>{if (!fileHandle) fileHandle=handle;}).catch(()=>{});
+  function writableFileHandle() {
+    if (acquiringHandle) return acquiringHandle;
+    acquiringHandle=(async()=>{
+      if (fileHandle) {
+        let permission=await fileHandle.queryPermission({mode:'readwrite'});
+        if (permission === 'prompt') permission=await fileHandle.requestPermission({mode:'readwrite'});
+        if (permission === 'granted') return fileHandle;
+      }
+      if (typeof window.showSaveFilePicker !== 'function') throw Error('当前浏览器不支持直接写入 HTML，请使用 Chrome 或 Edge。');
+      const suggestedName=decodeURIComponent(location.pathname.split('/').pop() || '已标注.html');
+      fileHandle=await window.showSaveFilePicker({suggestedName,types:[{description:'HTML 文件',accept:{'text/html':['.html']}}]});
+      rememberFileHandle(fileHandle).catch(()=>{});
+      return fileHandle;
+    })().finally(()=>{acquiringHandle=null;});
+    return acquiringHandle;
+  }
+  function writeHTMLFile(data) {
+    const handle=writableFileHandle(), html=buildAnnotatedHTML(data.base,data,document.getElementById('hae-runtime').textContent);
+    fileWriteQueue=fileWriteQueue.catch(()=>{}).then(async()=>{const writable=await (await handle).createWritable();await writable.write(html);await writable.close();});
+    return fileWriteQueue;
+  }
   const root = document.createElement('div');
   root.id = 'hae-root';
   root.style.cssText = 'all:initial!important;position:fixed!important;inset:0!important;z-index:2147483647!important;pointer-events:none!important;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif!important;color:#172b4d!important;color-scheme:light!important;';
@@ -244,7 +297,7 @@
     <section id="detail" class="section hide"></section>
     <form id="form" class="section hide"><h3 id="formTitle" class="title"></h3><div class="note-fields"><label id="numberLabel">编号<input id="number" type="number" min="1" step="1" required></label><label>类型<select id="type" required><option value="" disabled>请选择类型</option><option value="字段说明">字段说明</option><option value="交互逻辑">交互逻辑</option><option value="业务规则">业务规则</option><option value="修改原型">修改原型</option></select></label></div><p id="numberHint" class="help"></p><label>注记内容<textarea id="body" maxlength="20000" required></textarea></label><p id="location" class="help"></p><div id="targetActions" class="form-target-actions"><button type="button" id="parent">上一级区域</button><button type="button" id="child">下一级区域</button><button type="button" id="relocate">重新选择位置</button></div><div id="submitActions" class="form-submit-actions"><button type="button" id="cancelNote">取消</button><button id="confirmNote" type="submit" class="primary">确认添加</button></div></form>
   </article>
-  <nav id="tools" class="tools" aria-label="标注工具栏"><button id="add" title="添加标注" aria-label="添加标注"><span style="font-size:24px;font-weight:300;line-height:1;color:#555562" aria-hidden="true">＋</span></button><button id="toolDirectory" title="标注目录" aria-label="标注目录" aria-expanded="false" aria-controls="list"><img id="directoryIcon" alt=""></button><button id="toolNotes" title="显示／隐藏标注" aria-label="显示／隐藏标注" aria-pressed="true"><img id="notesIcon" alt=""></button><button id="toolSettings" title="标注设置" aria-label="标注设置" aria-expanded="false" aria-controls="settings"><img id="settingsIcon" alt=""></button></nav>
+  <nav id="tools" class="tools" aria-label="标注工具栏"><button id="add" title="添加标注" aria-label="添加标注"><span style="font-size:24px;font-weight:300;line-height:1;color:#555562" aria-hidden="true">＋</span></button><button id="toolDirectory" title="标注目录" aria-label="标注目录" aria-expanded="false" aria-controls="list"><img id="directoryIcon" alt=""></button><button id="toolNotes" title="显示／隐藏标注" aria-label="显示／隐藏标注" aria-pressed="true"><img id="notesIcon" alt=""></button><button id="toolSettings" title="标注设置" aria-label="标注设置" aria-expanded="false" aria-controls="settings"><img id="settingsIcon" alt=""></button><button id="toolSave" title="保存到 HTML 文件" aria-label="保存到 HTML 文件" style="font-size:11px;border-top:1px solid #e5e5e8;border-radius:0 0 6px 6px">保存</button></nav>
   <p id="status" class="visually-hidden" role="status" aria-live="polite"></p>
   `;
   const $ = id => shadow.getElementById(id);
@@ -377,11 +430,28 @@
     render();
   }
   function commitNotes(next) {
-    const updated = {...config, notes:clone(next)};
+    const updated = {...config, notes:clone(next), savedAt:Date.now()};
     document.getElementById('hae-data').textContent = safeJSON(updated);
-    notes = next; config.notes = updated.notes;
-    hasPageChanges = !persistNotes(noteStorage,storageKey,updated.notes);
-    return !hasPageChanges;
+    notes = next; config.notes = updated.notes; config.savedAt = updated.savedAt;
+    persistNotes(noteStorage,storageKey,updated.notes,updated.savedAt);
+    hasPageChanges = true;
+  }
+  async function saveFile() {
+    if (formNote || picking) {say('请先确认或取消当前注记，再保存文件。'); return;}
+    const button = $('toolSave');
+    if (button.disabled) return;
+    const snapshot = clone(config);
+    button.disabled = true;
+    say('正在保存文件…');
+    try {
+      await writeHTMLFile(snapshot);
+      hasPageChanges = JSON.stringify(config.notes) !== JSON.stringify(snapshot.notes);
+      window.alert(hasPageChanges ? '保存成功。保存期间产生的新修改尚未保存，请再次点击保存。' : '保存成功，注记已写入所选 HTML 文件。');
+      say(hasPageChanges ? '有新的修改尚未保存。' : '保存成功。');
+    } catch (error) {
+      const message = error.name === 'AbortError' ? '已取消保存，修改尚未写入文件。' : '保存失败：'+error.message;
+      say(message); window.alert(message);
+    } finally {button.disabled = false;}
   }
   function renderDetail() {
     const note = notes.find(item => item.id === selected), detail = $('detail');
@@ -394,7 +464,7 @@
     row.append(newButton('编辑', () => startEdit(note)));
     row.append(newButton('删除', () => {
       const confirmRow = document.createElement('div'); confirmRow.className = 'row actions';
-      confirmRow.append('删除后后续编号补齐。', newButton('确认删除', () => {const saved=commitNotes(removeNote(notes, note.id)); selected = null; render(); say(saved ? '注记已删除并自动保存。' : '注记已删除，但自动保存失败，请导出清单备份。');}, 'danger'), newButton('保留', renderDetail));
+      confirmRow.append('删除后后续编号补齐。', newButton('确认删除', () => {commitNotes(removeNote(notes, note.id)); selected = null; render(); say('注记已删除，请点击工具栏底部的保存写入文件。');}, 'danger'), newButton('保留', renderDetail));
       row.replaceWith(confirmRow);
     }, 'danger'));
     detail.append(row);
@@ -559,11 +629,10 @@
     delete note.title;
     if (!resolve(note)) {say('目标已变化或不唯一，请重新选择位置。'); return;}
     const exists = notes.some(n => n.id === note.id);
-    let saved;
-    try {saved=commitNotes(exists ? editNote(notes,note,Number($('number').value)) : insertNote(notes,note,Number($('number').value)));}
+    try {commitNotes(exists ? editNote(notes,note,Number($('number').value)) : insertNote(notes,note,Number($('number').value)));}
     catch (error) {say(error.message); return;}
     selected = null; formNote = null; candidate = null; chain = []; render();
-    say(saved ? (exists ? '注记已更新并自动保存。' : '注记已添加并自动保存。') : (exists ? '注记已更新，但自动保存失败，请导出清单备份。' : '注记已添加，但自动保存失败，请导出清单备份。'));
+    say((exists ? '注记已更新' : '注记已添加')+'，请点击工具栏底部的保存写入文件。');
   };
   $('cancelNote').onclick = () => {formNote = null; candidate = null; chain = []; render();};
   $('relocate').onclick = beginPick;
@@ -594,6 +663,7 @@
   $('toolDirectory').onclick = () => setPanel(panelView==='directory' ? null : 'directory');
   $('toolSettings').onclick = () => {setPanel(panelView==='settings' ? null : 'settings'); if (innerWidth<900 && !formNote) {selected=null;render();}};
   $('toolNotes').onclick = () => {$('shown').checked=!shown; $('shown').onchange();};
+  $('toolSave').onclick = saveFile;
   $('closeNote').onclick = () => {if (formNote && !confirm('取消当前注记的未保存修改？')) return; ++navigationRequest;selected=null;formNote=null;candidate=null;render();};
   $('number').oninput = () => {$('noteNumber').textContent = '#'+$('number').value;};
   $('type').onchange = () => {$('noteType').textContent = $('type').value || '未设置类型'; $('popover').setAttribute('data-type',$('type').value);};

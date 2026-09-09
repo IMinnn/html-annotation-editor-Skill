@@ -6,7 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {execFileSync, spawnSync} = require('node:child_process');
 const vm = require('node:vm');
-const {insertNote, editNote, removeNote, safeJSON, noteStorageKey, validStoredNotes, loadStoredNotes, persistNotes, placePopover, discoverMenus, menuForNote, directoryGroups, annotationTable, listMarkdown, listXLSX} = require('../assets/editor.js');
+const {insertNote, editNote, removeNote, safeJSON, noteStorageKey, validStoredNotes, loadStoredState, persistNotes, buildAnnotatedHTML, placePopover, discoverMenus, menuForNote, directoryGroups, annotationTable, listMarkdown, listXLSX} = require('../assets/editor.js');
 
 // This skill uses only plain scalar frontmatter, so validate it without PyYAML.
 const skill = fs.readFileSync(path.join(__dirname,'../SKILL.md'),'utf8');
@@ -60,15 +60,24 @@ const savedNotes=[{id:'saved',body:'已保存注记',selector:'#target',type:'�
 const savedStorage={value:JSON.stringify(savedNotes),getItem(){return this.value;},setItem(key,value){this.key=key;this.value=value;}};
 assert.equal(noteStorageKey('same-base'),noteStorageKey('same-base'));
 assert.notEqual(noteStorageKey('same-base'),noteStorageKey('other-base'));
-assert.deepEqual(loadStoredNotes(savedStorage,noteStorageKey('same-base'),embeddedNotes),savedNotes);
+assert.deepEqual(loadStoredState(savedStorage,noteStorageKey('same-base'),embeddedNotes),{notes:savedNotes,savedAt:0});
 savedStorage.value='{broken';
-assert.deepEqual(loadStoredNotes(savedStorage,noteStorageKey('same-base'),embeddedNotes),embeddedNotes);
+assert.deepEqual(loadStoredState(savedStorage,noteStorageKey('same-base'),embeddedNotes),{notes:embeddedNotes,savedAt:0});
 savedStorage.value=JSON.stringify([{id:'bad',body:'',selector:'#target'}]);
 assert.equal(validStoredNotes(JSON.parse(savedStorage.value)),false);
-assert.deepEqual(loadStoredNotes(savedStorage,noteStorageKey('same-base'),embeddedNotes),embeddedNotes);
-assert.equal(persistNotes(savedStorage,'key',savedNotes),true);
-assert.deepEqual(JSON.parse(savedStorage.value),savedNotes);
-assert.equal(persistNotes({setItem(){throw Error('quota');}},'key',savedNotes),false);
+assert.deepEqual(loadStoredState(savedStorage,noteStorageKey('same-base'),embeddedNotes),{notes:embeddedNotes,savedAt:0});
+savedStorage.value=JSON.stringify({notes:savedNotes,savedAt:20});
+assert.deepEqual(loadStoredState(savedStorage,'key',embeddedNotes,10),{notes:savedNotes,savedAt:20});
+assert.deepEqual(loadStoredState(savedStorage,'key',embeddedNotes,30),{notes:embeddedNotes,savedAt:30});
+assert.equal(persistNotes(savedStorage,'key',savedNotes,40),true);
+assert.deepEqual(JSON.parse(savedStorage.value),{notes:savedNotes,savedAt:40});
+assert.equal(persistNotes({setItem(){throw Error('quota');}},'key',savedNotes,40),false);
+const sourceHTML='<!doctype html><html><body><p>原型</p></body></html>', runtime='console.log("runtime")';
+const fileData={version:1,base:Buffer.from(sourceHTML).toString('base64'),notes:savedNotes,savedAt:40};
+const rebuilt=buildAnnotatedHTML(fileData.base,fileData,runtime);
+assert(rebuilt.includes('<p>原型</p><!-- HTML-ANNOTATION-EDITOR:BEGIN -->'));
+assert.deepEqual(JSON.parse(rebuilt.match(/<script id="hae-data" type="application\/json">([\s\S]*?)<\/script>/)[1]),fileData);
+assert.equal(rebuilt.match(/<script id="hae-runtime">([\s\S]*?)<\/script>/)[1],runtime);
 const unloadBody=editorSource.match(/window\.addEventListener\('beforeunload', event => \{([\s\S]*?)\}\);/)[1];
 function unloadProtected(hasPageChanges,formNote) {
   const event={prevented:false,preventDefault(){this.prevented=true;},returnValue:null};
@@ -78,6 +87,29 @@ function unloadProtected(hasPageChanges,formNote) {
 assert.equal(unloadProtected(false,null),false);
 assert.equal(unloadProtected(false,{body:'尚未确认'}),true);
 assert.equal(unloadProtected(true,null),true);
+// Exercise the actual asynchronous save boundary, including edits made during a write.
+const saveSource=editorSource.match(/async function saveFile\(\) \{[\s\S]*?\n  \}/)[0];
+execFileSync(process.execPath,['-e',`
+const assert=require('node:assert/strict'),vm=require('node:vm'),fs=require('node:fs');
+const source=fs.readFileSync(0,'utf8');
+(async()=>{
+ const button={disabled:false},alerts=[];
+ let finish,writes=0;
+ const state={config:{notes:[{id:'a',body:'new'}]},hasPageChanges:true,formNote:null,picking:false,
+ clone:structuredClone,$:()=>button,say(){},window:{alert:message=>alerts.push(message)},
+ writeHTMLFile:()=>{writes++;return new Promise(resolve=>{finish=resolve;});}};
+ vm.createContext(state);vm.runInContext(source,state);
+ let pending=state.saveFile();assert(button.disabled);assert(state.hasPageChanges);assert.equal(alerts.length,0);
+ await state.saveFile();assert.equal(writes,1);
+ finish();await pending;assert.equal(state.hasPageChanges,false);assert(!button.disabled);assert(alerts.at(-1).includes('保存成功'));
+ state.hasPageChanges=true;pending=state.saveFile();state.config.notes[0].body='newer';finish();await pending;assert(state.hasPageChanges);
+ state.writeHTMLFile=async()=>{throw Object.assign(Error('cancelled'),{name:'AbortError'});};
+ await state.saveFile();assert(state.hasPageChanges);assert(!button.disabled);assert(alerts.at(-1).includes('取消保存'));
+ state.writeHTMLFile=async()=>{throw Error('disk full');};await state.saveFile();assert(state.hasPageChanges);assert(alerts.at(-1).includes('保存失败'));
+ state.formNote={};state.writeHTMLFile=()=>{throw Error('must not save incomplete form');};await state.saveFile();
+ console.log('PASS: manual save, pending/failed writes, repeat-click guard and edits during save.');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+`],{input:saveSource,stdio:['pipe','inherit','inherit']});
 // Verify the delivered demo's actual menu DOM, route switching and note grouping.
 const demoPath=path.join(__dirname,'../../网页标注编辑器-交互示例.html');
 if (fs.existsSync(demoPath)) {
@@ -283,7 +315,7 @@ assert 'submitActions' in p.ids['cancelNote'] and 'submitActions' in p.ids['conf
 assert 'aside' in p.ids['settings'] and 'popover' not in p.ids['settings']
 assert 'settings' in p.ids['hideAll'] and 'settings' in p.ids['exportList'] and 'settings' in p.ids['exportType']
 assert 'saveAll' not in p.ids
-assert p.tool_buttons==['add','toolDirectory','toolNotes','toolSettings']
+assert p.tool_buttons==['add','toolDirectory','toolNotes','toolSettings','toolSave']
 `],{input:template});
 const templateIds=new Set([...template.matchAll(/\bid="([^"]+)"/g)].map(m=>m[1]));
 for (const match of editorSource.matchAll(/\$\('([^']+)'\)/g)) assert(templateIds.has(match[1]),'Missing editor element: '+match[1]);
@@ -310,13 +342,14 @@ vm.runInContext('schedule();',hidden);assert.equal(frames,1);
 // Exercise the real save handler with no title input, for both new and existing notes.
 const submitBody=editorSource.match(/\$\('form'\)\.onsubmit = event => \{([\s\S]*?)\n  \};/)[1];
 const commitSource=editorSource.match(/function commitNotes\(next\) \{[\s\S]*?\n  \}/)[0];
-const persistSource=editorSource.match(/function persistNotes\(storage, key, notes\) \{[\s\S]*?\n  \}/)[0];
-function submitContent(existing, body, type='字段说明', number='1', items=existing ? [existing] : [], storage={setItem(){}}) {
+const persistSource=editorSource.match(/function persistNotes\(storage, key, notes, savedAt\) \{[\s\S]*?\n  \}/)[0];
+function submitContent(existing, body, type='字段说明', number='1', items=existing ? [existing] : [], fileError=null) {
   const fields={body:{value:body},number:{value:number},type:{value:type}};
   const dataElement={textContent:''};
   const state={notes:items,formNote:existing || {id:'new',selector:'#target'},
     $:id=>{assert(fields[id],'Unexpected form field: '+id);return fields[id]},event:{preventDefault(){}},
-    config:{notes:items},document:{getElementById:()=>dataElement},dataElement,noteStorage:storage,storageKey:'test-key',hasPageChanges:false,
+    config:{notes:items,base:'base'},document:{getElementById:()=>dataElement},dataElement,noteStorage:{setItem(){}},storageKey:'test-key',hasPageChanges:false,
+    Date:{now:()=>40},writeHTMLFile(){throw Error('单条编辑不得触发文件写入');},
     clone:structuredClone,safeJSON,resolve:()=>true,editNote,insertNote,render(){},say(message){state.message=message}};
   vm.runInNewContext(persistSource+';'+commitSource+';(function(){'+submitBody+'})()',state);return state;
 }
@@ -327,18 +360,19 @@ assert.equal(created.notes[0].type,'字段说明');
 assert.equal(created.formNote,null);
 assert.equal(created.config.notes[0].body,'新的注记内容');
 assert.equal(JSON.parse(created.dataElement.textContent).notes[0].type,'字段说明');
-assert.equal(created.message,'注记已添加并自动保存。');
-assert.equal(created.hasPageChanges,false);
+assert.equal(created.message,'注记已添加，请点击工具栏底部的保存写入文件。');
+assert.equal(created.hasPageChanges,true);
+assert.equal(JSON.parse(created.dataElement.textContent).savedAt,40);
 const changed=submitContent({id:'old',title:'已有目录名称',body:'旧内容',selector:'#target',type:'业务规则'},'新内容','交互逻辑');
 assert.equal(changed.notes[0].title,undefined);
 assert.equal(changed.notes[0].body,'新内容');
 assert.equal(changed.notes[0].type,'交互逻辑');
 assert.equal(JSON.parse(changed.dataElement.textContent).notes[0].body,'新内容');
-assert.equal(changed.message,'注记已更新并自动保存。');
-const failedSave=submitContent(null,'当前操作仍保留','字段说明','1',[],{setItem(){throw Error('quota');}});
+assert.equal(changed.message,'注记已更新，请点击工具栏底部的保存写入文件。');
+const failedSave=submitContent(null,'当前操作仍保留','字段说明','1',[],Error('用户取消'));
 assert.equal(failedSave.notes[0].body,'当前操作仍保留');
 assert.equal(failedSave.hasPageChanges,true);
-assert(failedSave.message.includes('自动保存失败'));
+assert(failedSave.message.includes('请点击工具栏底部的保存'));
 const movedByForm=submitContent(original[0],'编辑并后移','字段说明','3',original);
 assert.deepEqual(movedByForm.notes.map(n=>n.id),['b','c','a']);
 assert.deepEqual(JSON.parse(movedByForm.dataElement.textContent).notes.map(n=>n.id),['b','c','a']);
@@ -386,7 +420,7 @@ const baseline=[{id:'first',title:'原注记',body:'内容'}];
 const deletedData={textContent:''};
 const deletion={notes:structuredClone(baseline),config:{notes:structuredClone(baseline)},selected:'first',formNote:null,picking:false,hasPageChanges:false,
   $:()=>node(),document:{createElement:node,getElementById:()=>deletedData},visibleRect:()=>true,resolve:()=>true,
-  noteStorage:{setItem(){}},storageKey:'test-key',newButton:(text,onclick)=>{const button={text,onclick};buttons.push(button);return button;},
+  noteStorage:{setItem(){}},storageKey:'test-key',Date:{now:()=>40},writeHTMLFile(){throw Error('删除不得触发文件写入');},newButton:(text,onclick)=>{const button={text,onclick};buttons.push(button);return button;},
   startEdit(){},removeNote,render(){},say(){},clone:structuredClone,safeJSON};
 vm.createContext(deletion);
 vm.runInContext(persistSource+';'+commitSource+';'+editorSource.match(/function renderDetail\(\) \{[\s\S]*?\n  \}/)[0]+';renderDetail();',deletion);
@@ -394,7 +428,7 @@ assert.deepEqual(buttons.map(button=>button.text),['编辑','删除']);
 buttons.find(button=>button.text==='删除').onclick();
 buttons.find(button=>button.text==='确认删除').onclick();
 assert.equal(deletion.notes.length,0);
-assert.equal(deletion.hasPageChanges,false);
+assert.equal(deletion.hasPageChanges,true);
 assert.equal(deletion.config.notes.length,0);
 assert.equal(JSON.parse(deletedData.textContent).notes.length,0);
 const cancelBody=editorSource.match(/\$\('cancelNote'\)\.onclick = \(\) => \{([^\n]+)\};/)[1];
