@@ -6,7 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {execFileSync, spawnSync} = require('node:child_process');
 const vm = require('node:vm');
-const {insertNote, editNote, removeNote, safeJSON, noteStorageKey, validStoredNotes, loadStoredState, persistNotes, buildAnnotatedHTML, placePopover, discoverMenus, menuForNote, directoryGroups, annotationTable, listMarkdown, listXLSX} = require('../assets/editor.js');
+const {insertNote, editNote, removeNote, safeJSON, noteStorageKey, validStoredNotes, loadStoredState, persistNotes, buildAnnotatedHTML, downloadedHTMLName, downloadAnnotatedHTML, placePopover, discoverMenus, mergeMenus, menuForNote, controlActiveScore, activeMenuForControls, menuPathForMenu, menuForSelection, directoryGroups, annotationTable, listMarkdown, listXLSX} = require('../assets/editor.js');
 
 // This skill uses only plain scalar frontmatter, so validate it without PyYAML.
 const skill = fs.readFileSync(path.join(__dirname,'../SKILL.md'),'utf8');
@@ -78,6 +78,13 @@ const rebuilt=buildAnnotatedHTML(fileData.base,fileData,runtime);
 assert(rebuilt.includes('<p>原型</p><!-- HTML-ANNOTATION-EDITOR:BEGIN -->'));
 assert.deepEqual(JSON.parse(rebuilt.match(/<script id="hae-data" type="application\/json">([\s\S]*?)<\/script>/)[1]),fileData);
 assert.equal(rebuilt.match(/<script id="hae-runtime">([\s\S]*?)<\/script>/)[1],runtime);
+assert.equal(downloadedHTMLName('/tmp/%E6%B5%8B%E8%AF%95.html'),'测试-已更新.html');
+assert.equal(downloadedHTMLName('/tmp/prototype'),'prototype-已更新.html');
+let clicked=false,removed=false,revoked='',deferred=0,downloadLink;
+const downloadDocument={body:{append(link){downloadLink=link;}},createElement(tag){assert.equal(tag,'a');return {click(){clicked=true;},remove(){removed=true;}};}};
+const downloadURL={createObjectURL(blob){assert(blob instanceof Blob);return 'blob:updated';},revokeObjectURL(url){revoked=url;}};
+const downloadResult=downloadAnnotatedHTML(rebuilt,'/tmp/demo.html',downloadDocument,downloadURL,(callback,delay)=>{deferred=delay;callback();});
+assert.deepEqual(downloadResult,{mode:'download',name:'demo-已更新.html'});assert.equal(downloadLink.download,'demo-已更新.html');assert.equal(downloadLink.href,'blob:updated');assert(clicked&&removed);assert.equal(revoked,'blob:updated');assert.equal(deferred,30000);
 const unloadBody=editorSource.match(/window\.addEventListener\('beforeunload', event => \{([\s\S]*?)\}\);/)[1];
 function unloadProtected(hasPageChanges,formNote) {
   const event={prevented:false,preventDefault(){this.prevented=true;},returnValue:null};
@@ -97,7 +104,7 @@ const source=fs.readFileSync(0,'utf8');
  let finish,writes=0;
  const state={config:{notes:[{id:'a',body:'new'}]},hasPageChanges:true,formNote:null,picking:false,
  clone:structuredClone,$:()=>button,say(){},window:{alert:message=>alerts.push(message)},
- writeHTMLFile:()=>{writes++;return new Promise(resolve=>{finish=resolve;});}};
+ writeHTMLFile:()=>{writes++;return new Promise(resolve=>{finish=()=>resolve({mode:'write',name:'demo.html'});});}};
  vm.createContext(state);vm.runInContext(source,state);
  let pending=state.saveFile();assert(button.disabled);assert(state.hasPageChanges);assert.equal(alerts.length,0);
  await state.saveFile();assert.equal(writes,1);
@@ -106,8 +113,9 @@ const source=fs.readFileSync(0,'utf8');
  state.writeHTMLFile=async()=>{throw Object.assign(Error('cancelled'),{name:'AbortError'});};
  await state.saveFile();assert(state.hasPageChanges);assert(!button.disabled);assert(alerts.at(-1).includes('取消保存'));
  state.writeHTMLFile=async()=>{throw Error('disk full');};await state.saveFile();assert(state.hasPageChanges);assert(alerts.at(-1).includes('保存失败'));
+ state.formNote=null;state.writeHTMLFile=async()=>({mode:'download',name:'demo-已更新.html'});await state.saveFile();assert.equal(state.hasPageChanges,false);assert(alerts.at(-1).includes('原文件不会被覆盖'));assert(alerts.at(-1).includes('demo-已更新.html'));
  state.formNote={};state.writeHTMLFile=()=>{throw Error('must not save incomplete form');};await state.saveFile();
- console.log('PASS: manual save, pending/failed writes, repeat-click guard and edits during save.');
+ console.log('PASS: direct write/download fallback, pending/failed writes, repeat-click guard and edits during save.');
 })().catch(error=>{console.error(error);process.exitCode=1;});
 `],{input:saveSource,stdio:['pipe','inherit','inherit']});
 // Verify the delivered demo's actual menu DOM, route switching and note grouping.
@@ -188,11 +196,13 @@ const detailControl=control('详情',{href:'#inner'},listContainer);
 const routeA=control('配置',{'data-route':'#route-a'},listContainer);
 const routeB=control('配置',{'data-route':'#route-b'},listContainer);
 const outside=control('站外',{href:'https://example.com/'},listContainer);
+const navToggle=control('收起菜单',{'aria-controls':'sidebarNav'},listContainer);
 const unrelated=control('删除',{},listContainer,false,false);
 const host={title:'示例页面',getElementById:id=>({area,inner}[id]),querySelectorAll(selector){
-  if(selector.startsWith('a[href]'))return [group,listControl,detailControl,routeA,routeB,outside,unrelated];
+  if(selector.startsWith('a[href]'))return [group,listControl,detailControl,routeA,routeB,outside,navToggle,unrelated];
   return {'[id="area"]':[area],'[id="inner"]':[inner],'#target':[target],'#missing':[]}[selector] || [];
 }};
+host.getElementById=id=>id==='sidebarNav'?{matches:selector=>selector.includes('nav')}:{area,inner}[id];
 const menus=discoverMenus(host,'file:///demo.html');
 assert.deepEqual(menus.map(m=>m.label),['项目管理','列表','详情','配置','配置']);
 assert.equal(menus[1].parentId,menus[0].id);assert.equal(menus[4].parentId,menus[0].id);
@@ -201,6 +211,37 @@ assert.equal(menuForNote({selector:'#target'},menus,host).id,menus[2].id);
 assert.equal(menuForNote({selector:'#target',context:'#route-a'},menus,host).id,menus[3].id);
 assert.equal(menuForNote({selector:'#target',context:'#unknown'},menus,host),null);
 assert.equal(menuForNote({selector:'#target',pageId:'missing'},menus,host),null);
+const activeParent={getAttribute:key=>key==='class'?'ant-menu-submenu-selected':null,closest(){return null;}};
+const activeLeaf={getAttribute:key=>key==='aria-current'?'page':null,closest(){return null;}};
+const activeControls=new Map([[menus[0].id,activeParent],[menus[3].id,activeLeaf]]);
+assert.equal(controlActiveScore(activeParent),2);assert.equal(controlActiveScore(activeLeaf),4);
+assert.equal(activeMenuForControls(menus,activeControls).id,menus[3].id);
+assert.equal(menuForSelection('#target','',menus,host,activeControls).id,menus[3].id); // Active page beats an unrelated containing region.
+assert.equal(menuForSelection('#target','#route-b',menus,host,new Map()).id,menus[4].id);
+assert.equal(menuPathForMenu(menus[2],menus),'项目管理 / 详情');
+assert.equal(activeMenuForControls(menus,new Map([[menus[3].id,activeLeaf],[menus[4].id,activeLeaf]])),null);
+// Generated configuration may use business page IDs while runtime discovery uses route:* IDs.
+// They must become one canonical tree so automatic and manually added notes share a page.
+const configuredMenus=[
+  {id:'configured-projects',label:'◉ 项目管理'},
+  {id:'configured-route-a',label:'配置',parentId:'configured-projects',context:'#route-a',selector:'#area'},
+  {id:'configured-route-b',label:'配置 B',parentId:'configured-projects',context:'#route-b',selector:'#area'}
+];
+const mergedControls=new Map([[menus[0].id,activeParent],[menus[3].id,activeLeaf]]);
+const mergedMenus=mergeMenus(menus,configuredMenus,mergedControls);
+assert.equal(mergedMenus.filter(menu=>menu.context==='#route-a').length,1);
+assert.equal(mergedMenus.filter(menu=>menu.context==='#route-b').length,1);
+assert.equal(mergedMenus.find(menu=>menu.id==='configured-route-a').parentId,'configured-projects');
+assert.equal(menuPathForMenu(mergedMenus.find(menu=>menu.id==='configured-route-a'),mergedMenus),'◉ 项目管理 / 配置');
+assert.equal(mergedControls.has(menus[3].id),false);
+assert.equal(mergedControls.get('configured-route-a'),activeLeaf);
+assert.equal(menuForSelection('#target','#route-a',mergedMenus,host,mergedControls).id,'configured-route-a');
+const mixedTree=directoryGroups([
+  {id:'auto',pageId:'configured-route-a',selector:'#target',body:'自动标注'},
+  {id:'manual',pageId:'configured-route-a',selector:'#target',body:'手动标注'}
+],mergedMenus,host);
+const mergedPage=mixedTree.find(group=>group.id==='configured-projects').children.find(group=>group.id==='configured-route-a');
+assert.deepEqual(mergedPage.notes.map(item=>item.note.id),['auto','manual']);
 const directoryNotes=[{id:'a',selector:'#target',body:'完整内容\n第二行',type:'字段说明'},
   {id:'b',selector:'#target',context:'#route-b',body:'待产研修改原型',type:'修改原型'},
   {id:'c',selector:'#missing',body:'保留未匹配注记'}];
@@ -215,11 +256,12 @@ assert.equal(directoryGroups(insertNote(directoryNotes,{id:'new',selector:'#targ
 const targetBody=editorSource.match(/function acceptTarget\(\) \{([\s\S]*?)\n  \}/)[1];
 const pickFields=Object.fromEntries(['formTitle','body','type','confirmNote','location'].map(id=>[id,{focus(){}}]));
 const pickState={candidate:target,formNote:null,visibleRect:()=>true,selectorFor:()=>'#target',context:()=>'#inner',
-  fingerprint:()=>({tag:'button'}),crypto:{randomUUID:()=>'new-id'},hostMenus:()=>menus,menuForNote,document:host,
+  fingerprint:()=>({tag:'button'}),crypto:{randomUUID:()=>'new-id'},hostMenus:()=>menus,menuElements:new Map(),menuForSelection,menuPathForMenu,document:host,
   $:id=>pickFields[id],configureNumber(){},endPick(){},say(){}};
 vm.runInNewContext('(function(){'+targetBody+'})()',pickState);
 assert.equal(pickState.formNote.pageId,menus[2].id);
 assert.equal(pickState.formNote.context,'*'); // Section navigation must not hide a freshly added note.
+assert.equal(pickState.formNote.menuPath,'项目管理 / 详情');
 assert.equal(pickState.formNote.title,undefined);
 assert(!editorSource.includes('confirmTarget'));
 assert(!editorSource.includes('id="picker"'));
@@ -230,7 +272,7 @@ function uiNode(tag){return {tag,children:[],append(...items){this.children.push
 const listNode=uiNode('div'),opened=[];
 const directoryState={notes:directoryNotes,selected:null,formNote:null,picking:false,say(){},openPage:group=>opened.push(group.id),directorySignature:'',expandedMenus:new Set(),hostMenus:()=>menus,
   directoryGroups,document:{...host,createElement:uiNode},$:()=>listNode,
-  newButton:(text,onclick,className)=>({...uiNode('button'),text,onclick,className}),openNote:id=>opened.push(id)};
+  newButton:(text,onclick,className)=>({...uiNode('button'),text,onclick,className}),openNote:(id,force)=>opened.push([id,force])};
 vm.createContext(directoryState);
 vm.runInContext(editorSource.match(/function renderDirectory\(\) \{[\s\S]*?\n  \}/)[0]+';renderDirectory();',directoryState);
 assert.equal(listNode.children[0].tag,'details');assert.equal(listNode.children[0].open,false);
@@ -245,10 +287,10 @@ assert.equal(entries[0].children[0].children[0].textContent,1);
 assert.equal(entries[0].children[0].children[1].textContent,'字段说明');
 assert.equal(entries[0].children[1].textContent,'完整内容\n第二行');
 assert.equal(entries[1]['data-type'],'修改原型');
-entries[1].onclick();assert.deepEqual(opened,['b']);
+entries[1].onclick();assert.deepEqual(opened,[['b',true]]);
 listNode.children[0].open=false;listNode.children[0].ontoggle();assert.equal(directoryState.expandedMenus.size,0);
 const detailGroup=allNodes(listNode).find(n=>n.tag==='details'&&n.children[0].children[0]==='详情');
-detailGroup.children[0].onclick({preventDefault(){}});assert.equal(opened.at(-1),'a');
+detailGroup.children[0].onclick({preventDefault(){}});assert.deepEqual(opened.at(-1),['a',true]);
 const emptyGroup=allNodes(listNode).find(n=>n.tag==='details'&&n.children[0].children[0]==='列表');
 emptyGroup.children[0].onclick({preventDefault(){}});assert.equal(opened.at(-1),menus[1].id);
 
@@ -272,6 +314,7 @@ const source=fs.readFileSync(0,'utf8');
  vm.createContext(state);vm.runInContext(source,state);
  await state.openNote('note-b');assert.equal(page,'b');assert.equal(state.selected,'note-b');assert.equal(state.shown,true);assert.deepEqual(scrolled,['b']);
  await state.openNote('note-b');assert.deepEqual(calls,['b']); // Same page only scrolls.
+ await state.openNote('note-b',true);assert.deepEqual(calls,['b','b']); // Directory clicks always navigate by pageId.
  await Promise.all([state.openNote('note-a'),state.openNote('note-b')]);assert.equal(state.selected,'note-b');assert.equal(renders.at(-1),'note-b');
  state.formNote={body:'未保存'};const before=calls.length;await state.openNote('note-a');assert.equal(calls.length,before);state.formNote=null;
  state.window.htmlAnnotationNavigate=async(id)=>{await Promise.resolve();page=id;};

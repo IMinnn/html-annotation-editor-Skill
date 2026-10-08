@@ -35,6 +35,19 @@
     const closings=[...source.matchAll(/<\/body\s*>/ig)], at=closings.length ? closings.at(-1).index : source.length;
     return source.slice(0,at)+block+source.slice(at);
   }
+  function downloadedHTMLName(pathname) {
+    let name = '已标注.html';
+    try {name = decodeURIComponent(String(pathname || '').split('/').pop() || name);} catch {}
+    return /\.html?$/i.test(name) ? name.replace(/(\.html?)$/i,'-已更新$1') : name+'-已更新.html';
+  }
+  function downloadAnnotatedHTML(html, pathname, doc = document, urlAPI = URL, defer = setTimeout) {
+    const name = downloadedHTMLName(pathname), blob = new Blob([html],{type:'text/html;charset=utf-8'});
+    const url = urlAPI.createObjectURL(blob), link = doc.createElement('a');
+    link.href = url; link.download = name;
+    doc.body.append(link); link.click(); link.remove();
+    defer(()=>urlAPI.revokeObjectURL(url),30000);
+    return {mode:'download',name};
+  }
   const listHeaders = ['编号','菜单路径','目标区域','注记类型','注记内容'];
   function annotationTable(notes, menus, doc, exportType = 'simple') {
     if (!['simple','detailed'].includes(exportType)) throw Error('请选择导出类型。');
@@ -124,7 +137,10 @@
       const controlled = el.getAttribute('aria-controls');
       const href = el.getAttribute('href');
       let selector, context;
-      if (controlled && doc.getElementById(controlled)) selector = '[id='+JSON.stringify(controlled)+']';
+      const controlledElement = controlled && doc.getElementById(controlled);
+      // A shell button that expands/collapses the navigation controls the menu itself, not a page.
+      if (controlledElement?.matches?.(scope) && !page && !href) continue;
+      if (controlledElement) selector = '[id='+JSON.stringify(controlled)+']';
       if (page) context = page;
       if (href && !href.startsWith('javascript:')) {
         let url; try {url = new URL(href, baseURL);} catch {continue;}
@@ -151,6 +167,63 @@
     }
     return records;
   }
+  function mergeMenus(discovered, configured = [], controls = new Map()) {
+    const live = discovered.map(menu => ({...menu})), declared = configured.map(menu => ({...menu}));
+    if (!declared.length) return live;
+    const alias = new Map(), matchFor = new Map(), claimed = new Set();
+    const claim = (menu, candidate) => {
+      if (!candidate || claimed.has(candidate.id)) return false;
+      alias.set(candidate.id,menu.id); matchFor.set(menu.id,candidate); claimed.add(candidate.id); return true;
+    };
+    for (const menu of declared) {
+      let candidate = live.find(item => item.id === menu.id && !claimed.has(item.id));
+      if (!candidate && menu.context !== undefined) {
+        const matches = live.filter(item => !claimed.has(item.id) && item.context === menu.context);
+        if (matches.length === 1) candidate = matches[0];
+      }
+      if (!candidate && menu.selector && menu.context === undefined) {
+        const matches = live.filter(item => !claimed.has(item.id) && item.selector === menu.selector);
+        if (matches.length === 1) candidate = matches[0];
+      }
+      claim(menu,candidate);
+    }
+    const labelKey = value => String(value || '').replace(/[^\p{Letter}\p{Number}]+/gu,'').toLocaleLowerCase();
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const menu of declared) {
+        if (matchFor.has(menu.id)) continue;
+        const children = declared.filter(item => item.parentId === menu.id), parentIds = new Set();
+        for (const child of children) {
+          const matched = matchFor.get(child.id);
+          if (matched?.parentId) parentIds.add(matched.parentId);
+        }
+        let candidate = parentIds.size === 1 ? live.find(item => item.id === [...parentIds][0] && !claimed.has(item.id)) : null;
+        if (!candidate) {
+          const key = labelKey(menu.label);
+          const matches = live.filter(item => !claimed.has(item.id) && item.context === undefined && !item.selector && labelKey(item.label) === key);
+          if (matches.length === 1) candidate = matches[0];
+        }
+        if (claim(menu,candidate)) changed = true;
+      }
+    }
+    const emitted = new Set(), result = [];
+    for (const item of live) {
+      const id = alias.get(item.id) || item.id;
+      if (emitted.has(id)) continue;
+      const configured = declared.find(menu => menu.id === id);
+      const merged = configured ? {...item,...configured,id} : {...item,id,parentId:alias.get(item.parentId) || item.parentId};
+      if (configured && configured.parentId === undefined) merged.parentId = alias.get(item.parentId) || item.parentId;
+      result.push(merged); emitted.add(id);
+    }
+    for (const menu of declared) if (!emitted.has(menu.id)) {result.push({...menu}); emitted.add(menu.id);}
+    for (const [oldId,newId] of alias) {
+      if (oldId === newId || !controls.has(oldId)) continue;
+      if (!controls.has(newId)) controls.set(newId,controls.get(oldId));
+      controls.delete(oldId);
+    }
+    return result.map(menu => ({...menu,parentId:alias.get(menu.parentId) || menu.parentId}));
+  }
   function menuForNote(note, menus, doc) {
     if (note.pageId) return menus.find(menu => menu.id === note.pageId) || null;
     if (note.context !== undefined && note.context !== '*') {
@@ -169,6 +242,44 @@
       if (!bestElement || bestElement.contains(areas[0])) {best = menu; bestElement = areas[0];}
     }
     return best;
+  }
+  function controlActiveScore(control) {
+    if (!control) return 0;
+    const container = control.closest?.('li,details,[role="menuitem"],.menu-item');
+    let score = 0;
+    for (const element of [control,container]) {
+      if (!element?.getAttribute) continue;
+      const ariaCurrent = element.getAttribute('aria-current');
+      if (ariaCurrent && ariaCurrent !== 'false') score = Math.max(score,4);
+      if (element.getAttribute('aria-selected') === 'true') score = Math.max(score,3);
+      if (['true',''].includes(element.getAttribute('data-active')) || ['true',''].includes(element.getAttribute('data-selected'))) score = Math.max(score,3);
+      const classes = String(element.getAttribute('class') || '').split(/\s+/).filter(Boolean);
+      if (classes.some(name => /(^|[-_])(active|selected|current)$/.test(name))) score = Math.max(score,2);
+    }
+    return score;
+  }
+  function activeMenuForControls(menus, controls) {
+    const map = new Map(menus.map(menu => [menu.id,menu]));
+    const depth = menu => {let value=0,cursor=menu,seen=new Set();while(cursor?.parentId&&map.has(cursor.parentId)&&!seen.has(cursor.parentId)){seen.add(cursor.parentId);cursor=map.get(cursor.parentId);value++;}return value;};
+    const candidates = menus.filter(menu => menu.selector || menu.context !== undefined)
+      .map(menu => ({menu,score:controlActiveScore(controls.get(menu.id)),depth:depth(menu)})).filter(item => item.score > 0)
+      .sort((a,b)=>b.score-a.score || b.depth-a.depth);
+    if (!candidates.length) return null;
+    const best = candidates.filter(item => item.score===candidates[0].score && item.depth===candidates[0].depth);
+    return best.length === 1 ? best[0].menu : null;
+  }
+  function menuPathForMenu(menu, menus) {
+    if (!menu) return '';
+    const map = new Map(menus.map(item => [item.id,item])), labels = [], seen = new Set();
+    for (let cursor=menu;cursor&&!seen.has(cursor.id);cursor=map.get(cursor.parentId)) {seen.add(cursor.id);labels.unshift(cursor.label);}
+    return labels.filter(Boolean).join(' / ');
+  }
+  function menuForSelection(selector, currentContext, menus, doc, controls) {
+    if (currentContext && currentContext !== '*') {
+      const exact = menus.filter(menu => menu.context === currentContext);
+      if (exact.length === 1) return exact[0];
+    }
+    return activeMenuForControls(menus,controls) || menuForNote({selector},menus,doc);
   }
   function directoryGroups(notes, menus, doc) {
     const groups = menus.map(menu => ({...menu,children:[],notes:[]}));
@@ -195,7 +306,7 @@
     return {x, y:Math.max(12, Math.min(y, viewport.height-height-12))};
   }
   if (typeof document === 'undefined') {
-    if (typeof module !== 'undefined' && module.exports) module.exports = {insertNote, editNote, removeNote, safeJSON, noteStorageKey, validStoredNotes, loadStoredState, persistNotes, buildAnnotatedHTML, placePopover, discoverMenus, menuForNote, directoryGroups, annotationTable, listMarkdown, listXLSX};
+    if (typeof module !== 'undefined' && module.exports) module.exports = {insertNote, editNote, removeNote, safeJSON, noteStorageKey, validStoredNotes, loadStoredState, persistNotes, buildAnnotatedHTML, downloadedHTMLName, downloadAnnotatedHTML, placePopover, discoverMenus, mergeMenus, menuForNote, controlActiveScore, activeMenuForControls, menuPathForMenu, menuForSelection, directoryGroups, annotationTable, listMarkdown, listXLSX};
     return;
   }
   if (document.getElementById('hae-root')) return;
@@ -246,8 +357,10 @@
     return acquiringHandle;
   }
   function writeHTMLFile(data) {
-    const handle=writableFileHandle(), html=buildAnnotatedHTML(data.base,data,document.getElementById('hae-runtime').textContent);
-    fileWriteQueue=fileWriteQueue.catch(()=>{}).then(async()=>{const writable=await (await handle).createWritable();await writable.write(html);await writable.close();});
+    const html=buildAnnotatedHTML(data.base,data,document.getElementById('hae-runtime').textContent);
+    if (typeof window.showSaveFilePicker !== 'function') return Promise.resolve(downloadAnnotatedHTML(html,location.pathname));
+    const handle=writableFileHandle();
+    fileWriteQueue=fileWriteQueue.catch(()=>{}).then(async()=>{const activeHandle=await handle,writable=await activeHandle.createWritable();await writable.write(html);await writable.close();return {mode:'write',name:activeHandle.name || decodeURIComponent(location.pathname.split('/').pop() || '已标注.html')};});
     return fileWriteQueue;
   }
   const root = document.createElement('div');
@@ -317,11 +430,7 @@
   const hostMenus = () => {
     menuElements.clear();
     const menus = discoverMenus(document,location.href,(id,el)=>menuElements.set(id,el));
-    for (const menu of config.menus || []) {
-      const index = menus.findIndex(item => item.id === menu.id);
-      if (index < 0) menus.push(menu); else menus[index] = {...menus[index],...menu};
-    }
-    return menus;
+    return mergeMenus(menus,config.menus || [],menuElements);
   };
   const normalize = text => text.replace(/\s+/g, ' ').trim().slice(0, 100);
   const fingerprint = element => ({tag: element.localName, text: normalize(element.textContent || '')});
@@ -444,10 +553,19 @@
     button.disabled = true;
     say('正在保存文件…');
     try {
-      await writeHTMLFile(snapshot);
+      const result = await writeHTMLFile(snapshot);
       hasPageChanges = JSON.stringify(config.notes) !== JSON.stringify(snapshot.notes);
-      window.alert(hasPageChanges ? '保存成功。保存期间产生的新修改尚未保存，请再次点击保存。' : '保存成功，注记已写入所选 HTML 文件。');
-      say(hasPageChanges ? '有新的修改尚未保存。' : '保存成功。');
+      let message;
+      if (result?.mode === 'download') {
+        message = hasPageChanges
+          ? '已下载“'+result.name+'”，但下载期间产生的新修改尚未包含，请再次点击保存。'
+          : '已下载更新后的 HTML：“'+result.name+'”。当前打开的原文件不会被覆盖；请在其他浏览器打开或分享这份下载文件。';
+      } else {
+        message = hasPageChanges
+          ? '已写入“'+(result?.name || '所选 HTML 文件')+'”，但保存期间产生的新修改尚未写入，请再次点击保存。'
+          : '保存成功，注记已写入“'+(result?.name || '所选 HTML 文件')+'”。';
+      }
+      window.alert(message); say(message);
     } catch (error) {
       const message = error.name === 'AbortError' ? '已取消保存，修改尚未写入文件。' : '保存失败：'+error.message;
       say(message); window.alert(message);
@@ -490,7 +608,7 @@
       };
       details.ontoggle = () => {if (details.open) expandedMenus.add(group.id); else expandedMenus.delete(group.id);};
       for (const {note,number} of group.notes) {
-        const entry = newButton('', () => openNote(note.id), 'entry'); entry.setAttribute('aria-pressed',String(selected === note.id)); entry.setAttribute('data-type',note.type || '');
+        const entry = newButton('', () => openNote(note.id,true), 'entry'); entry.setAttribute('aria-pressed',String(selected === note.id)); entry.setAttribute('data-type',note.type || '');
         const header = document.createElement('div'); header.className = 'entry-head';
         const num = document.createElement('b'); num.textContent = number;
         const type = document.createElement('span'); type.textContent = note.type || '未设置类型';
@@ -611,10 +729,11 @@
       $('formTitle').textContent = '添加注记'; $('body').value = ''; $('type').value = ''; configureNumber(null);
       $('confirmNote').textContent = '确认添加';
     } else Object.assign(formNote, {selector, context:context(), fingerprint:fingerprint(candidate)});
-    const menus = hostMenus();
-    const page = menuForNote({selector,context:context()},menus,document) || menuForNote({selector},menus,document);
+    const menus = hostMenus(), currentContext = context();
+    const page = menuForSelection(selector,currentContext,menus,document,menuElements);
     delete formNote.pageId;
-    if (page) {formNote.pageId = page.id; if (page.selector && page.context === undefined) formNote.context = '*';}
+    delete formNote.menuPath;
+    if (page) {formNote.pageId = page.id; formNote.menuPath = menuPathForMenu(page,menus); if (page.selector && page.context === undefined) formNote.context = '*';}
     $('location').textContent = '位置：' + selector;
     endPick(); $('body').focus();
   }
